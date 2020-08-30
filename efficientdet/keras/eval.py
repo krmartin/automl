@@ -21,9 +21,11 @@ import tensorflow as tf
 import coco_metric
 import dataloader
 import hparams_config
+import utils
 
 from keras import anchors
 from keras import efficientdet_keras
+from keras import label_util
 from keras import postprocess
 from keras import wbf
 
@@ -35,6 +37,7 @@ flags.DEFINE_string(
 flags.DEFINE_string('model_name', 'efficientdet-d0', 'Model name to use.')
 flags.DEFINE_string('model_dir', None, 'Location of the checkpoint to run.')
 flags.DEFINE_integer('batch_size', 8, 'Batch size.')
+flags.DEFINE_integer('eval_samples', 8, 'Batch size.')
 flags.DEFINE_string('hparams', '', 'Comma separated k=v pairs or a yaml file')
 flags.DEFINE_boolean('enable_tta', False,
                      'Use test time augmentation (slower, but more accurate).')
@@ -46,58 +49,83 @@ def main(_):
   config.override(FLAGS.hparams)
   config.batch_size = FLAGS.batch_size
   config.val_json_file = FLAGS.val_json_file
-
-  # dataset
-  ds = dataloader.InputReader(
-      FLAGS.val_file_pattern,
-      is_training=False,
-      use_fake_data=False,
-      max_instances_per_image=config.max_instances_per_image)(
-          config)
+  config.nms_configs.max_nms_inputs = anchors.MAX_DETECTION_POINTS
+  base_height, base_width = utils.parse_image_size(config['image_size'])
 
   # Network
   model = efficientdet_keras.EfficientDetNet(config=config)
-  model.build((config.batch_size, None, None, 3))
+  model.build((config.batch_size, base_height, base_width, 3))
   model.load_weights(tf.train.latest_checkpoint(FLAGS.model_dir))
 
-  evaluator = coco_metric.EvaluationMetric(filename=config.val_json_file)
+  @tf.function
+  def f(imgs, labels, flip):
+    cls_outputs, box_outputs = model(imgs, training=False)
+    return postprocess.generate_detections(config, cls_outputs, box_outputs,
+                                           labels['image_scales'],
+                                           labels['source_ids'], flip)
 
-  # compute stats for all batches.
-  for images, labels in ds:
-    config.nms_configs.max_nms_inputs = anchors.MAX_DETECTION_POINTS
+  # in format (height, width, flip)
+  augmentations = []
+  if FLAGS.enable_tta:
+    for size_offset in (0, 128, 256):
+      for flip in (False, True):
+        augmentations.append(
+            (base_height + size_offset, base_width + size_offset, flip))
+  else:
+    augmentations.append((base_height, base_width, False))
 
-    cls_outputs, box_outputs = model(images, training=False)
-    detections = postprocess.generate_detections(config, cls_outputs,
-                                                 box_outputs,
-                                                 labels['image_scales'],
-                                                 labels['source_ids'], False)
+  evaluator = None
+  detections_per_source = dict()
+  for height, width, flip in augmentations:
+    config.image_size = (height, width)
+    # dataset
+    ds = dataloader.InputReader(
+        FLAGS.val_file_pattern,
+        is_training=False,
+        use_fake_data=False,
+        max_instances_per_image=config.max_instances_per_image)(
+            config)
 
-    if FLAGS.enable_tta:
-      images_flipped = tf.image.flip_left_right(images)
-      cls_outputs_flipped, box_outputs_flipped = model(
-          images_flipped, training=False)
-      detections_flipped = postprocess.generate_detections(
-          config, cls_outputs_flipped, box_outputs_flipped,
-          labels['image_scales'], labels['source_ids'], True)
+    # compute stats for all batches.
+    total_steps = FLAGS.eval_samples // FLAGS.batch_size
+    progress = tf.keras.utils.Progbar(total_steps)
+    for i, (images, labels) in enumerate(ds):
+      progress.update(i, values=None)
+      if i > total_steps:
+        break
 
-      for d, df in zip(detections, detections_flipped):
-        combined_detections = wbf.ensemble_detections(config,
-                                                      tf.concat([d, df], 0))
-        combined_detections = tf.stack([combined_detections])
+      if flip:
+        images = tf.image.flip_left_right(images)
+      detections = f(images, labels, flip)
+
+      for img_id, d in zip(labels['source_ids'], detections):
+        if img_id.numpy() in detections_per_source:
+          detections_per_source[img_id.numpy()] = tf.concat(
+              [d, detections_per_source[img_id.numpy()]], 0)
+        else:
+          detections_per_source[img_id.numpy()] = d
+
+      evaluator = coco_metric.EvaluationMetric(filename=config.val_json_file)
+      for d in detections_per_source.values():
+        if FLAGS.enable_tta:
+          d = wbf.ensemble_detections(config, d, len(augmentations))
         evaluator.update_state(
             labels['groundtruth_data'].numpy(),
-            postprocess.transform_detections(combined_detections).numpy())
-    else:
-      evaluator.update_state(
-          labels['groundtruth_data'].numpy(),
-          postprocess.transform_detections(detections).numpy())
+            postprocess.transform_detections(tf.stack([d])).numpy())
 
   # compute the final eval results.
-  metric_values = evaluator.result()
-  metric_dict = {}
-  for i, metric_value in enumerate(metric_values):
-    metric_dict[evaluator.metric_names[i]] = metric_value
-  print(metric_dict)
+  if evaluator:
+    metrics = evaluator.result()
+    metric_dict = {}
+    for i, name in enumerate(evaluator.metric_names):
+      metric_dict[name] = metrics[i]
+
+    label_map = label_util.get_label_map(config.label_map)
+    if label_map:
+      for i, cid in enumerate(sorted(label_map.keys())):
+        name = 'AP_/%s' % label_map[cid]
+        metric_dict[name] = metrics[i - len(evaluator.metric_names)]
+    print(metric_dict)
 
 
 if __name__ == '__main__':

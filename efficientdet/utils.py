@@ -30,14 +30,14 @@ def srelu_fn(x):
   """Smooth relu: a smooth version of relu."""
   with tf.name_scope('srelu'):
     beta = tf.Variable(20.0, name='srelu_beta', dtype=tf.float32)**2
-    beta = tf.cast(beta, x.dtype)
+    beta = tf.cast(beta**2, x.dtype)
     safe_log = tf.math.log(tf.where(x > 0., beta * x + 1., tf.ones_like(x)))
     return tf.where((x > 0.), x - (1. / beta) * safe_log, tf.zeros_like(x))
 
 
 def activation_fn(features: tf.Tensor, act_type: Text):
   """Customized non-linear activation type."""
-  if act_type == 'swish':
+  if act_type in ('silu', 'swish'):
     return tf.nn.swish(features)
   elif act_type == 'swish_native':
     return features * tf.sigmoid(features)
@@ -372,7 +372,7 @@ def drop_connect(inputs, is_training, survival_prob):
   # Unlike conventional way that multiply survival_prob at test time, here we
   # divide survival_prob at training time, such that no addition compute is
   # needed at test time.
-  output = tf.div(inputs, survival_prob) * binary_tensor
+  output = inputs / survival_prob * binary_tensor
   return output
 
 

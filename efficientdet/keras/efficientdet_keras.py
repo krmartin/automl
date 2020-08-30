@@ -25,7 +25,7 @@ from backbone import backbone_factory
 from backbone import efficientnet_builder
 from keras import fpn_configs
 from keras import postprocess
-from keras import utils_keras
+from keras import util_keras
 # pylint: disable=arguments-differ  # fo keras layers.
 
 
@@ -33,8 +33,7 @@ class FNode(tf.keras.layers.Layer):
   """A Keras Layer implementing BiFPN Node."""
 
   def __init__(self,
-               new_node_height,
-               new_node_width,
+               feat_level,
                inputs_offsets,
                fpn_num_filters,
                apply_bn_for_resampling,
@@ -48,8 +47,7 @@ class FNode(tf.keras.layers.Layer):
                data_format,
                name='fnode'):
     super().__init__(name=name)
-    self.new_node_height = new_node_height
-    self.new_node_width = new_node_width
+    self.feat_level = feat_level
     self.inputs_offsets = inputs_offsets
     self.fpn_num_filters = fpn_num_filters
     self.apply_bn_for_resampling = apply_bn_for_resampling
@@ -61,7 +59,7 @@ class FNode(tf.keras.layers.Layer):
     self.data_format = data_format
     self.weight_method = weight_method
     self.conv_bn_act_pattern = conv_bn_act_pattern
-    self.resample_feature_maps = []
+    self.resample_layers = []
     self.vars = []
 
   def fuse_features(self, nodes):
@@ -132,17 +130,16 @@ class FNode(tf.keras.layers.Layer):
   def build(self, feats_shape):
     for i, input_offset in enumerate(self.inputs_offsets):
       name = 'resample_{}_{}_{}'.format(i, input_offset, len(feats_shape))
-      resample_feature_map = ResampleFeatureMap(
-          self.new_node_height,
-          self.new_node_width,
-          self.fpn_num_filters,
-          self.apply_bn_for_resampling,
-          self.is_training_bn,
-          self.conv_after_downsample,
-          strategy=self.strategy,
-          data_format=self.data_format,
-          name=name)
-      self.resample_feature_maps.append(resample_feature_map)
+      self.resample_layers.append(
+          ResampleFeatureMap(
+              self.feat_level,
+              self.fpn_num_filters,
+              self.apply_bn_for_resampling,
+              self.is_training_bn,
+              self.conv_after_downsample,
+              strategy=self.strategy,
+              data_format=self.data_format,
+              name=name))
     if self.weight_method == 'attn':
       self._add_wsm('ones')
     elif self.weight_method == 'fastattn':
@@ -163,17 +160,19 @@ class FNode(tf.keras.layers.Layer):
         self.strategy,
         name='op_after_combine{}'.format(len(feats_shape)))
     self.built = True
+    super().build(feats_shape)
 
   def call(self, feats, training):
     nodes = []
+    append_feats = []
     for i, input_offset in enumerate(self.inputs_offsets):
       input_node = feats[input_offset]
-      input_node = self.resample_feature_maps[i](input_node, training)
+      input_node = self.resample_layers[i](input_node, training, feats)
       nodes.append(input_node)
     new_node = self.fuse_features(nodes)
     new_node = self.op_after_combine(new_node)
-    feats.append(new_node)
-    return feats
+    append_feats.append(new_node)
+    return feats + append_feats
 
 
 class OpAfterCombine(tf.keras.layers.Layer):
@@ -209,7 +208,7 @@ class OpAfterCombine(tf.keras.layers.Layer):
         use_bias=not self.conv_bn_act_pattern,
         data_format=self.data_format,
         name='conv')
-    self.bn = utils_keras.build_batch_norm(
+    self.bn = util_keras.build_batch_norm(
         is_training_bn=self.is_training_bn,
         data_format=self.data_format,
         strategy=self.strategy,
@@ -229,92 +228,97 @@ class ResampleFeatureMap(tf.keras.layers.Layer):
   """Resample feature map for downsampling or upsampling."""
 
   def __init__(self,
-               target_height,
-               target_width,
+               feat_level,
                target_num_channels,
                apply_bn=False,
                is_training_bn=None,
                conv_after_downsample=False,
                strategy=None,
                data_format=None,
+               pooling_type=None,
+               upsampling_type=None,
                name='resample_p0'):
     super().__init__(name=name)
     self.apply_bn = apply_bn
     self.is_training_bn = is_training_bn
     self.data_format = data_format
     self.target_num_channels = target_num_channels
-    self.target_height = target_height
-    self.target_width = target_width
+    self.feat_level = feat_level
     self.strategy = strategy
     self.conv_after_downsample = conv_after_downsample
+    self.pooling_type = pooling_type or 'max'
+    self.upsampling_type = upsampling_type or 'nearest'
+
     self.conv2d = tf.keras.layers.Conv2D(
         self.target_num_channels, (1, 1),
         padding='same',
         data_format=self.data_format,
         name='conv2d')
-    self.bn = utils_keras.build_batch_norm(
+    self.bn = util_keras.build_batch_norm(
         is_training_bn=self.is_training_bn,
         data_format=self.data_format,
         strategy=self.strategy,
         name='bn')
 
-  def build(self, input_shape):
-    """Resample input feature map to have target number of channels and size."""
-    if self.data_format == 'channels_first':
-      _, num_channels, height, width = input_shape.as_list()
+  def _pool2d(self, inputs, height, width, target_height, target_width):
+    """Pool the inputs to target height and width."""
+    height_stride_size = int((height - 1) // target_height + 1)
+    width_stride_size = int((width - 1) // target_width + 1)
+    if self.pooling_type == 'max':
+      return tf.keras.layers.MaxPooling2D(
+          pool_size=[height_stride_size + 1, width_stride_size + 1],
+          strides=[height_stride_size, width_stride_size],
+          padding='SAME',
+          data_format=self.data_format)(inputs)
+    elif self.pooling_type == 'avg':
+      self.pool2d = tf.keras.layers.AveragePooling2D(
+          pool_size=[height_stride_size + 1, width_stride_size + 1],
+          strides=[height_stride_size, width_stride_size],
+          padding='SAME',
+          data_format=self.data_format)
     else:
-      _, height, width, num_channels = input_shape.as_list()
+      raise ValueError('Unsupported pooling type {}.'.format(self.pooling_type))
 
-    if height is None or width is None or num_channels is None:
-      raise ValueError(
-          'shape[1] or shape[2] or shape[3] of feat is None (shape:{}).'.format(
-              input_shape.as_list()))
-    if self.apply_bn and self.is_training_bn is None:
-      raise ValueError('If BN is applied, need to provide is_training_bn')
-    self.num_channels = num_channels
-    self.height = height
-    self.width = width
-    height_stride_size = int((self.height - 1) // self.target_height + 1)
-    width_stride_size = int((self.width - 1) // self.target_width + 1)
+  def _upsample2d(self, inputs, target_height, target_width):
+    return tf.cast(
+        tf.image.resize(
+            tf.cast(inputs, tf.float32), [target_height, target_width],
+            method=self.upsampling_type), inputs.dtype)
 
-    # Use max pooling in default.
-    self.pool2d = tf.keras.layers.MaxPooling2D(
-        pool_size=[height_stride_size + 1, width_stride_size + 1],
-        strides=[height_stride_size, width_stride_size],
-        padding='SAME',
-        data_format=self.data_format)
-
-    height_scale = self.target_height // self.height
-    width_scale = self.target_width // self.width
-    self.upsample2d = tf.keras.layers.UpSampling2D((height_scale, width_scale),
-                                                   data_format=self.data_format)
-    super().build(input_shape)
-
-  def _maybe_apply_1x1(self, feat, training):
+  def _maybe_apply_1x1(self, feat, training, num_channels):
     """Apply 1x1 conv to change layer width if necessary."""
-    if self.num_channels != self.target_num_channels:
+    if num_channels != self.target_num_channels:
       feat = self.conv2d(feat)
       if self.apply_bn:
         feat = self.bn(feat, training=training)
     return feat
 
-  def call(self, feat, training):
+  def call(self, feat, training, all_feats):
+    hwc_idx = (2, 3, 1) if self.data_format == 'channels_first' else (1, 2, 3)
+    height, width, num_channels = [feat.shape.as_list()[i] for i in hwc_idx]
+    if all_feats:
+      target_feat_shape = all_feats[self.feat_level].shape.as_list()
+      target_height, target_width, _ = [target_feat_shape[i] for i in hwc_idx]
+    else:
+      # Default to downsampling if all_feats is empty.
+      target_height, target_width = (height + 1) // 2, (width + 1) // 2
+
     # If conv_after_downsample is True, when downsampling, apply 1x1 after
     # downsampling for efficiency.
-    if self.height > self.target_height and self.width > self.target_width:
+    if height > target_height and width > target_width:
       if not self.conv_after_downsample:
-        feat = self._maybe_apply_1x1(feat, training)
-      feat = self.pool2d(feat)
+        feat = self._maybe_apply_1x1(feat, training, num_channels)
+      feat = self._pool2d(feat, height, width, target_height, target_width)
       if self.conv_after_downsample:
-        feat = self._maybe_apply_1x1(feat, training)
-    elif self.height <= self.target_height and self.width <= self.target_width:
-      feat = self._maybe_apply_1x1(feat, training)
-      if self.height < self.target_height or self.width < self.target_width:
-        feat = self.upsample2d(feat)
+        feat = self._maybe_apply_1x1(feat, training, num_channels)
+    elif height <= target_height and width <= target_width:
+      feat = self._maybe_apply_1x1(feat, training, num_channels)
+      if height < target_height or width < target_width:
+        feat = self._upsample2d(feat, target_height, target_width)
     else:
       raise ValueError(
-          'Incompatible target feature map size: target_height: {},'
-          'target_width: {}'.format(self.target_height, self.target_width))
+          'Incompatible Resampling : feat shape {}x{} target_shape: {}x{}'
+          .format(height, width, target_height, target_width))
 
     return feat
 
@@ -397,7 +401,7 @@ class ClassNet(tf.keras.layers.Layer):
       bn_per_level = []
       for level in range(self.min_level, self.max_level + 1):
         bn_per_level.append(
-            utils_keras.build_batch_norm(
+            util_keras.build_batch_norm(
                 is_training_bn=self.is_training_bn,
                 strategy=self.strategy,
                 data_format=self.data_format,
@@ -516,7 +520,7 @@ class BoxNet(tf.keras.layers.Layer):
       bn_per_level = []
       for level in range(self.min_level, self.max_level + 1):
         bn_per_level.append(
-            utils_keras.build_batch_norm(
+            util_keras.build_batch_norm(
                 is_training_bn=self.is_training_bn,
                 strategy=self.strategy,
                 data_format=self.data_format,
@@ -606,7 +610,7 @@ class SegmentationHead(tf.keras.layers.Layer):
               data_format=data_format,
               use_bias=False))
       self.con2d_t_bns.append(
-          utils_keras.build_batch_norm(
+          util_keras.build_batch_norm(
               is_training_bn=is_training_bn,
               data_format=data_format,
               strategy=strategy,
@@ -635,7 +639,6 @@ class FPNCells(tf.keras.layers.Layer):
   def __init__(self, config, name='fpn_cells'):
     super().__init__(name=name)
     self.config = config
-    self.feat_sizes = utils.get_feat_sizes(config.image_size, config.max_level)
 
     if config.fpn_config:
       self.fpn_config = config.fpn_config
@@ -646,7 +649,7 @@ class FPNCells(tf.keras.layers.Layer):
                                                    config.fpn_weight_method)
 
     self.cells = [
-        FPNCell(self.feat_sizes, self.config, name='cell_%d' % rep)
+        FPNCell(self.config, name='cell_%d' % rep)
         for rep in range(self.config.fpn_cell_repeats)
     ]
 
@@ -669,9 +672,8 @@ class FPNCells(tf.keras.layers.Layer):
 class FPNCell(tf.keras.layers.Layer):
   """A single FPN cell."""
 
-  def __init__(self, feat_sizes, config, name='fpn_cell'):
+  def __init__(self, config, name='fpn_cell'):
     super().__init__(name=name)
-    self.feat_sizes = feat_sizes
     self.config = config
     if config.fpn_config:
       self.fpn_config = config.fpn_config
@@ -684,8 +686,7 @@ class FPNCell(tf.keras.layers.Layer):
     for i, fnode_cfg in enumerate(self.fpn_config.nodes):
       logging.info('fnode %d : %s', i, fnode_cfg)
       fnode = FNode(
-          feat_sizes[fnode_cfg['feat_level']]['height'],
-          feat_sizes[fnode_cfg['feat_level']]['width'],
+          fnode_cfg['feat_level'] - self.config.min_level,
           fnode_cfg['inputs_offsets'],
           config.fpn_num_filters,
           config.apply_bn_for_resampling,
@@ -737,14 +738,12 @@ class EfficientDetNet(tf.keras.Model):
           backbone_name, override_params=override_params)
 
     # Feature network.
-    feat_sizes = utils.get_feat_sizes(config.image_size, config.max_level)
     self.resample_layers = []  # additional resampling layers.
     for level in range(6, config.max_level + 1):
       # Adds a coarser level by downsampling the last feature map.
       self.resample_layers.append(
           ResampleFeatureMap(
-              target_height=feat_sizes[level]['height'],
-              target_width=feat_sizes[level]['width'],
+              feat_level=(level - config.min_level),
               target_num_channels=config.fpn_num_filters,
               apply_bn=config.apply_bn_for_resampling,
               is_training_bn=config.is_training_bn,
@@ -808,32 +807,24 @@ class EfficientDetNet(tf.keras.Model):
   def call(self, inputs, training):
     config = self.config
     # call backbone network.
-    self.backbone(inputs, training=training, features_only=True)
-    all_feats = [
-        inputs,
-        self.backbone.endpoints['reduction_1'],
-        self.backbone.endpoints['reduction_2'],
-        self.backbone.endpoints['reduction_3'],
-        self.backbone.endpoints['reduction_4'],
-        self.backbone.endpoints['reduction_5'],
-    ]
+    all_feats = self.backbone(inputs, training=training, features_only=True)
     feats = all_feats[config.min_level:config.max_level + 1]
 
     # Build additional input features that are not from backbone.
     for resample_layer in self.resample_layers:
-      feats.append(resample_layer(feats[-1], training))
+      feats.append(resample_layer(feats[-1], training, None))
 
     # call feature network.
-    feats = self.fpn_cells(feats, training)
+    fpn_feats = self.fpn_cells(feats, training)
 
     # call class/box/seg output network.
     outputs = []
     if 'object_detection' in config.heads:
-      class_outputs = self.class_net(feats, training)
-      box_outputs = self.box_net(feats, training)
+      class_outputs = self.class_net(fpn_feats, training)
+      box_outputs = self.box_net(fpn_feats, training)
       outputs.extend([class_outputs, box_outputs])
     if 'segmentation' in config.heads:
-      seg_outputs = self.seg_head(feats, training)
+      seg_outputs = self.seg_head(fpn_feats, training)
       outputs.append(seg_outputs)
     return tuple(outputs)
 
@@ -860,10 +851,17 @@ class EfficientDetModel(EfficientDetNet):
       image_scale = input_processor.image_scale_to_original
       return image, image_scale
 
-    return tf.map_fn(
-        map_fn, raw_images, dtype=(tf.float32, tf.float32), back_prop=False)
+    if raw_images.shape.as_list()[0]:  # fixed batch size.
+      batch_size = raw_images.shape.as_list()[0]
+      outputs = [map_fn(raw_images[i]) for i in range(batch_size)]
+      return [tf.stack(y) for y in zip(*outputs)]
+
+    # otherwise treat it as dynamic batch size.
+    return postprocess.batch_map_fn(
+        map_fn, raw_images, dtype=(tf.float32, tf.float32))
 
   def _postprocess(self, cls_outputs, box_outputs, scales, mode='global'):
+    """Postprocess class and box predictions."""
     if not mode:
       return cls_outputs, box_outputs
 

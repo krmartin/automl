@@ -44,9 +44,12 @@ def freeze_vars(variables, pattern):
     var_list: a list containing variables for training
   """
   if pattern:
-    variables = [v for v in variables if not re.match(pattern, v.name)]
-  return variables
-
+    _variables = [v for v in variables if not re.match(pattern, v.name)]
+    if len(_variables) == len(variables):
+        logging.warning(f'{pattern} pattern didnt match with any variable in the model.Please use compatible pattern. i.e "(efficientnet)"')
+    return _variables
+  else:
+    return variables
 
 def resize_bilinear(images, size, output_type):
   """Returns resized images as output_type."""
@@ -362,11 +365,11 @@ def build_backbone(features, config):
         backbone_name,
         training=is_training_bn,
         override_params=override_params)
-    u1 = endpoints['reduction_1']
-    u2 = endpoints['reduction_2']
-    u3 = endpoints['reduction_3']
-    u4 = endpoints['reduction_4']
-    u5 = endpoints['reduction_5']
+    u1 = endpoints[0]
+    u2 = endpoints[1]
+    u3 = endpoints[2]
+    u4 = endpoints[3]
+    u5 = endpoints[4]
   else:
     raise ValueError(
         'backbone model {} is not supported.'.format(backbone_name))
