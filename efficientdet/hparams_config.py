@@ -50,6 +50,9 @@ class Config(object):
   def __repr__(self):
     return repr(self.as_dict())
 
+  def __deepcopy__(self, memodict):
+    return type(self)(self.as_dict())
+
   def __str__(self):
     try:
       return yaml.dump(self.as_dict(), indent=4)
@@ -131,15 +134,18 @@ class Config(object):
         def add_kv_recursive(k, v):
           """Recursively parse x.y.z=tt to {x: {y: {z: tt}}}."""
           if '.' not in k:
+            if '*' in v:
+              # we reserve * to split arrays.
+              return {k: [eval_str_fn(vv) for vv in v.split('*')]}
             return {k: eval_str_fn(v)}
           pos = k.index('.')
-          return {k[:pos]: add_kv_recursive(k[pos+1:], v)}
+          return {k[:pos]: add_kv_recursive(k[pos + 1:], v)}
 
         def merge_dict_recursive(target, src):
           """Recursively merge two nested dictionary."""
           for k in src.keys():
             if ((k in target and isinstance(target[k], dict) and
-                 isinstance(src[k], collections.Mapping))):
+                 isinstance(src[k], collections.abc.Mapping))):
               merge_dict_recursive(target[k], src[k])
             else:
               target[k] = src[k]
@@ -158,7 +164,7 @@ class Config(object):
       else:
         config_dict[k] = copy.deepcopy(v)
     return config_dict
-# pylint: enable=protected-access
+    # pylint: enable=protected-access
 
 
 def default_detection_configs():
@@ -178,10 +184,9 @@ def default_detection_configs():
   h.jitter_min = 0.1
   h.jitter_max = 2.0
   h.autoaugment_policy = None
-  h.use_augmix = False
-  # mixture_width, mixture_depth, alpha
-  h.augmix_params = (3, -1, 1)
+  h.grid_mask = False
   h.sample_image = None
+  h.map_freq = 5  # AP eval frequency in epochs.
 
   # dataset specific parameters
   # TODO(tanmingxing): update this to be 91 for COCO, and 21 for pascal.
@@ -198,8 +203,8 @@ def default_detection_configs():
   h.min_level = 3
   h.max_level = 7
   h.num_scales = 3
-  # aspect ratio with format (w, h). Can be computed with k-mean per dataset.
-  h.aspect_ratios = [(1.0, 1.0), (1.4, 0.7), (0.7, 1.4)]
+  # ratio w/h: 2.0 means w=1.4, h=0.7. Can be computed with k-mean per dataset.
+  h.aspect_ratios = [1.0, 2.0, 0.5]  #[[0.7, 1.4], [1.0, 1.0], [1.4, 0.7]]
   h.anchor_scale = 4.0
   # is batchnorm training mode
   h.is_training_bn = True
@@ -231,9 +236,10 @@ def default_detection_configs():
 
   # regularization l2 loss.
   h.weight_decay = 4e-5
-  # use horovod for multi-gpu training. If None, use TF default.
-  h.strategy = None  # 'tpu', 'horovod', None
+  h.strategy = None  # 'tpu', 'gpus', None
   h.mixed_precision = False  # If False, use float32.
+  h.loss_scale = None  # set to 2**16 enables dynamic loss scale
+  h.model_optimizations = {}  # 'prune':{}
 
   # For detection.
   h.box_class_repeats = 3
@@ -243,13 +249,15 @@ def default_detection_configs():
   h.apply_bn_for_resampling = True
   h.conv_after_downsample = False
   h.conv_bn_act_pattern = False
+  h.drop_remainder = True  # drop remainder for the final batch eval.
 
   # For post-processing nms, must be a dict.
   h.nms_configs = {
       'method': 'gaussian',
       'iou_thresh': None,  # use the default value based on method.
-      'score_thresh': None,
+      'score_thresh': 0.,
       'sigma': None,
+      'pyfunc': False,
       'max_nms_inputs': 0,
       'max_output_size': 100,
   }
@@ -277,9 +285,8 @@ def default_detection_configs():
   h.use_keras_model = True
   h.dataset_type = None
   h.positives_momentum = None
+  h.grad_checkpoint = False
 
-  # unused.
-  h.resnet_depth = 50
   return h
 
 
@@ -379,51 +386,59 @@ efficientdet_lite_param_dict = {
         dict(
             name='efficientdet-lite0',
             backbone_name='efficientnet-lite0',
-            image_size=512,
+            image_size=320,
             fpn_num_filters=64,
             fpn_cell_repeats=3,
             box_class_repeats=3,
             act_type='relu',
+            fpn_weight_method='sum',
+            anchor_scale=3.0,
         ),
     'efficientdet-lite1':
         dict(
             name='efficientdet-lite1',
             backbone_name='efficientnet-lite1',
-            image_size=640,
+            image_size=384,
             fpn_num_filters=88,
             fpn_cell_repeats=4,
             box_class_repeats=3,
             act_type='relu',
+            fpn_weight_method='sum',
+            anchor_scale=3.0,
         ),
     'efficientdet-lite2':
         dict(
             name='efficientdet-lite2',
             backbone_name='efficientnet-lite2',
-            image_size=768,
+            image_size=448,
             fpn_num_filters=112,
             fpn_cell_repeats=5,
             box_class_repeats=3,
             act_type='relu',
+            fpn_weight_method='sum',
+            anchor_scale=3.0,
         ),
     'efficientdet-lite3':
         dict(
             name='efficientdet-lite3',
             backbone_name='efficientnet-lite3',
-            image_size=896,
+            image_size=512,
             fpn_num_filters=160,
             fpn_cell_repeats=6,
             box_class_repeats=4,
             act_type='relu',
+            fpn_weight_method='sum',
         ),
     'efficientdet-lite4':
         dict(
             name='efficientdet-lite4',
             backbone_name='efficientnet-lite4',
-            image_size=1024,
+            image_size=512,
             fpn_num_filters=224,
             fpn_cell_repeats=7,
             box_class_repeats=4,
             act_type='relu',
+            fpn_weight_method='sum',
         ),
 }
 

@@ -22,7 +22,7 @@ from object_detection import preprocessor
 from object_detection import tf_example_decoder
 
 
-class InputProcessor(object):
+class InputProcessor:
   """Base class of Input processor."""
 
   def __init__(self, image, output_size):
@@ -212,7 +212,6 @@ def pad_to_fixed_size(data, pad_value, output_shape):
     data: Tensor to be padded to output_shape.
     pad_value: A constant value assigned to the paddings.
     output_shape: The output shape of a 2D tensor.
-
   Returns:
     The Padded tensor with output_shape [max_instances_per_image, dimension].
   """
@@ -230,19 +229,21 @@ def pad_to_fixed_size(data, pad_value, output_shape):
   return padded_data
 
 
-class InputReader(object):
+class InputReader:
   """Input reader for dataset."""
 
   def __init__(self,
                file_pattern,
                is_training,
                use_fake_data=False,
-               max_instances_per_image=None):
+               max_instances_per_image=None,
+               debug=False):
     self._file_pattern = file_pattern
     self._is_training = is_training
     self._use_fake_data = use_fake_data
     # COCO has 100 limit, but users may set different values for custom dataset.
     self._max_instances_per_image = max_instances_per_image or 100
+    self._debug = debug
 
   @tf.autograph.experimental.do_not_convert
   def dataset_parser(self, value, example_decoder, anchor_labeler, params):
@@ -293,26 +294,33 @@ class InputReader(object):
       image_masks = data.get('groundtruth_instance_masks', [])
       classes = tf.reshape(tf.cast(classes, dtype=tf.float32), [-1, 1])
 
-      if params['skip_crowd_during_training'] and self._is_training:
-        indices = tf.where(tf.logical_not(data['groundtruth_is_crowd']))
-        classes = tf.gather_nd(classes, indices)
-        boxes = tf.gather_nd(boxes, indices)
+      if self._is_training:
+        # Training time preprocessing.
+        if params['skip_crowd_during_training']:
+          indices = tf.where(tf.logical_not(data['groundtruth_is_crowd']))
+          classes = tf.gather_nd(classes, indices)
+          boxes = tf.gather_nd(boxes, indices)
 
-      # NOTE: The autoaugment method works best when used alongside the
-      # standard horizontal flipping of images along with size jittering
-      # and normalization.
-      if params.get('autoaugment_policy', None) and self._is_training:
-        from aug import autoaugment  # pylint: disable=g-import-not-at-top
-        image, boxes = autoaugment.distort_image_with_autoaugment(
-            image, boxes, params['autoaugment_policy'], params['use_augmix'],
-            *params['augmix_params'])
+        if params.get('grid_mask', None):
+          from aug import gridmask  # pylint: disable=g-import-not-at-top
+          image, boxes = gridmask.gridmask(image, boxes)
+
+        if params.get('autoaugment_policy', None):
+          from aug import autoaugment  # pylint: disable=g-import-not-at-top
+          if params['autoaugment_policy'] == 'randaug':
+            image, boxes = autoaugment.distort_image_with_randaugment(
+                image, boxes, num_layers=1, magnitude=15)
+          else:
+            image, boxes = autoaugment.distort_image_with_autoaugment(
+                image, boxes, params['autoaugment_policy'])
 
       input_processor = DetectionInputProcessor(image, params['image_size'],
                                                 boxes, classes)
       input_processor.normalize_image()
-      if self._is_training and params['input_rand_hflip']:
-        input_processor.random_horizontal_flip()
       if self._is_training:
+        if params['input_rand_hflip']:
+          input_processor.random_horizontal_flip()
+
         input_processor.set_training_random_scale_factors(
             params['jitter_min'], params['jitter_max'],
             params.get('target_size', None))
@@ -339,6 +347,12 @@ class InputReader(object):
       areas = pad_to_fixed_size(areas, -1, [self._max_instances_per_image, 1])
       classes = pad_to_fixed_size(classes, -1,
                                   [self._max_instances_per_image, 1])
+      if params['mixed_precision']:
+        dtype = (
+            tf.keras.mixed_precision.experimental.global_policy().compute_dtype)
+        image = tf.cast(image, dtype=dtype)
+        box_targets = tf.nest.map_structure(
+            lambda box_target: tf.cast(box_target, dtype=dtype), box_targets)
       return (image, cls_targets, box_targets, num_positives, source_id,
               image_scale, boxes, is_crowds, areas, classes, image_masks)
 
@@ -374,7 +388,16 @@ class InputReader(object):
     labels['image_masks'] = image_masks
     return images, labels
 
-  def __call__(self, params):
+  @property
+  def dataset_options(self):
+    options = tf.data.Options()
+    options.experimental_deterministic = self._debug or not self._is_training
+    options.experimental_optimization.map_vectorization.enabled = True
+    options.experimental_optimization.map_parallelization = True
+    options.experimental_optimization.parallel_batch = True
+    return options
+
+  def __call__(self, params, input_context=None, batch_size=None):
     input_anchors = anchors.Anchors(params['min_level'], params['max_level'],
                                     params['num_scales'],
                                     params['aspect_ratios'],
@@ -386,12 +409,15 @@ class InputReader(object):
         regenerate_source_id=params['regenerate_source_id']
     )
 
-    batch_size = params['batch_size']
+    batch_size = batch_size or params['batch_size']
+    seed = params['tf_random_seed'] if self._debug else None
     dataset = tf.data.Dataset.list_files(
-        self._file_pattern, shuffle=self._is_training)
+        self._file_pattern, shuffle=self._is_training, seed=seed)
     if self._is_training:
       dataset = dataset.repeat()
-
+    if input_context:
+      dataset = dataset.shard(input_context.num_input_pipelines,
+                              input_context.input_pipeline_id)
     # Prefetch data from files.
     def _prefetch_dataset(filename):
       if params.get('dataset_type', None) == 'sstable':
@@ -402,11 +428,9 @@ class InputReader(object):
 
     dataset = dataset.interleave(
         _prefetch_dataset, num_parallel_calls=tf.data.experimental.AUTOTUNE)
-    options = tf.data.Options()
-    options.experimental_deterministic = not self._is_training
-    dataset = dataset.with_options(options)
+    dataset = dataset.with_options(self.dataset_options)
     if self._is_training:
-      dataset = dataset.shuffle(64)
+      dataset = dataset.shuffle(64, seed=seed)
 
     # Parse the fetched records to input tensors for model function.
     # pylint: disable=g-long-lambda
@@ -420,7 +444,7 @@ class InputReader(object):
     dataset = dataset.map(
         map_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
     dataset = dataset.prefetch(batch_size)
-    dataset = dataset.batch(batch_size, drop_remainder=True)
+    dataset = dataset.batch(batch_size, drop_remainder=params['drop_remainder'])
     dataset = dataset.map(
         lambda *args: self.process_example(params, batch_size, *args))
     dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)

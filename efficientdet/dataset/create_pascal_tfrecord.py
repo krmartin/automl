@@ -29,7 +29,7 @@ from absl import logging
 
 from lxml import etree
 import PIL.Image
-import tensorflow.compat.v1 as tf
+import tensorflow as tf
 
 from dataset import tfrecord_util
 
@@ -130,7 +130,7 @@ def dict_to_tf_example(data,
   """
   img_path = os.path.join(data['folder'], image_subdirectory, data['filename'])
   full_path = os.path.join(dataset_directory, img_path)
-  with tf.gfile.GFile(full_path, 'rb') as fid:
+  with tf.io.gfile.GFile(full_path, 'rb') as fid:
     encoded_jpg = fid.read()
   encoded_jpg_io = io.BytesIO(encoded_jpg)
   image = PIL.Image.open(encoded_jpg_io)
@@ -251,10 +251,14 @@ def main(_):
   if FLAGS.year != 'merged':
     years = [FLAGS.year]
 
-  logging.info('writing to output path: %s', FLAGS.output_path)
+  output_dir = os.path.dirname(FLAGS.output_path)
+  if not tf.io.gfile.exists(output_dir):
+    tf.io.gfile.makedirs(output_dir)
+  logging.info('Writing to output directory: %s', output_dir)
+
   writers = [
-      tf.python_io.TFRecordWriter(FLAGS.output_path + '-%05d-of-%05d.tfrecord' %
-                                  (i, FLAGS.num_shards))
+      tf.io.TFRecordWriter(FLAGS.output_path + '-%05d-of-%05d.tfrecord' %
+                           (i, FLAGS.num_shards))
       for i in range(FLAGS.num_shards)
   ]
 
@@ -271,22 +275,24 @@ def main(_):
       'categories': []
   }
   for year in years:
+    example_class = list(label_map_dict.keys())[1]
+    examples_path = os.path.join(data_dir, year, 'ImageSets', 'Main',
+                                 example_class + '_' + FLAGS.set + '.txt')
+    examples_list = tfrecord_util.read_examples_list(examples_path)
+    annotations_dir = os.path.join(data_dir, year, FLAGS.annotations_dir)
+
     for class_name, class_id in label_map_dict.items():
       cls = {'supercategory': 'none', 'id': class_id, 'name': class_name}
       ann_json_dict['categories'].append(cls)
 
     logging.info('Reading from PASCAL %s dataset.', year)
-    examples_path = os.path.join(data_dir, year, 'ImageSets', 'Main',
-                                 'aeroplane_' + FLAGS.set + '.txt')
-    annotations_dir = os.path.join(data_dir, year, FLAGS.annotations_dir)
-    examples_list = tfrecord_util.read_examples_list(examples_path)
     for idx, example in enumerate(examples_list):
       if FLAGS.num_images and idx >= FLAGS.num_images:
         break
       if idx % 100 == 0:
         logging.info('On image %d of %d', idx, len(examples_list))
       path = os.path.join(annotations_dir, example + '.xml')
-      with tf.gfile.GFile(path, 'r') as fid:
+      with tf.io.gfile.GFile(path, 'r') as fid:
         xml_str = fid.read()
       xml = etree.fromstring(xml_str)
       data = tfrecord_util.recursive_parse_xml_to_dict(xml)['annotation']
